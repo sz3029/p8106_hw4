@@ -1,0 +1,261 @@
+---
+title: "P8106 HW3"
+author: "Shihui Zhu"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyhead[R]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+--- 
+
+\newpage
+
+```{r setup, include=FALSE}
+# This chunk loads all the packages used in this homework
+library(ISLR)
+library(mlbench)
+library(caret)
+library(randomForest)
+library(ranger)
+library(gbm)
+library(pdp)
+library(pROC)
+library(rpart)
+library(xgboost)
+
+library(ggplot2)
+library(tidyverse)
+
+
+# General figure set up
+knitr::opts_chunk$set(
+  # hide warning messages
+  warning = FALSE
+)
+```
+
+# Regression - College Data
+
+```{r input_college, message=FALSE}
+college <- read_csv("College.csv")[-1] %>% 
+  janitor::clean_names() %>% 
+  na.omit()
+
+# training data (80%) and test data (20%)
+set.seed(1)
+rowTrain <- createDataPartition(y = college$outstate,
+                                p = 0.8,
+                                list = FALSE)
+college <- as.data.frame(college)
+```
+
+## (a) Build a regression tree on the training data to predict the response. 
+
+Create a plot of the tree:
+
+```{r rpart}
+ctrl <- trainControl(method = "cv")
+# train model
+set.seed(1)
+model.rpart <- train(outstate ~., data = college[rowTrain,], 
+                     method = "rpart",
+                     tuneGrid = data.frame(cp = exp(seq(-6, -2, length = 50))),
+                     trControl = ctrl)
+model.rpart$bestTune
+# plot the tree
+rpart.plot::rpart.plot(model.rpart$finalModel)
+```
+
+## (b) Perform random forest on the training data. Report the variable importance and the test error.
+
+### Model Tuning
+
+```{r rf}
+# Try more if possible
+rf.grid <- expand.grid(mtry = 1:16,
+                       splitrule = "variance",
+                       min.node.size = 1:6)
+set.seed(1)
+rf.fit <- train(outstate ~., 
+                data = college[rowTrain,],
+                method = "ranger",
+                tuneGrid = rf.grid,
+                trControl = ctrl)
+
+rf.fit$bestTune
+```
+The best model selected via CV has 7 splitting variables with minimum node size of 3.  
+
+### Variable Importance
+
+The total decrease in node impurities from splitting on the variable, averaged over all trees:
+
+```{r importance}
+set.seed(1)
+rf.imp <- ranger(outstate ~ . , 
+                 college[rowTrain,],
+                 mtry = rf.fit$bestTune[[1]],
+                 splitrule = "variance",
+                 min.node.size = rf.fit$bestTune[[3]],
+                 importance = "impurity") 
+
+barplot(sort(ranger::importance(rf.imp), decreasing = FALSE), 
+        las = 2, horiz = TRUE, cex.names = 0.7,
+        col = colorRampPalette(colors = c("cyan","blue"))(19))
+```
+
+The most importance factor affecting the out-of-state tuition is the Instructional expenditure per student (`expend`), then it is room and board costs(`room_board`), pct. of faculty with terminal degree (`terminal`), pct. of faculty with Ph.D.'s (`ph_d`), and pct. of new students from top 10% of H.S. class (`Top10perc`).
+
+### Test error
+
+```{r test_error}
+pred.rf <- predict(rf.fit, newdata = college[-rowTrain,])
+RMSE(pred.rf, college$outstate[-rowTrain])
+```
+
+The test error (RMSE) is 1623.252.
+
+## (c) Perform boosting on the training data
+
+Perform Boosting via XGBoost (Extreme Gradient Boosting)
+
+Tune by (step by step):
+1. Number of Iterations and the Learning Rate (some small `eta`)
+
+2. Maximum Depth and Minimum Child Weight (`max_depth` and `min_child_weight`)
+
+3. Column and Row Sampling (`colsample_bytree` and `subsample`)
+
+4. Gamma
+
+5. Reducing the Learning Rate (increase rounds and try very small `eta`)
+
+```{r boosting}
+# Tune by Number of Iterations and the Learning Rate
+xgb.grid <- expand.grid(
+  nrounds = seq(from = 600, to = 3000, by = 100),
+  eta = c(0.001, 0.002, 0.003, 0.004),
+  max_depth = 3, # best tuned max_depth
+  gamma = 0.5, # best tuned gamma
+  colsample_bytree = 0.6, # best tuned colsample_bytree
+  min_child_weight = 3, # best tuned min_child_weight
+  subsample = 0.5 # best tuned subsample
+)
+
+set.seed(1)
+xgb.fit <- train(outstate ~ . , 
+                 college[rowTrain,], 
+                 method = "xgbTree",
+                 tuneGrid = xgb.grid,
+                 trControl = ctrl,
+                 verbose = FALSE,
+                 verbosity = 0)
+
+ggplot(xgb.fit)
+xgb.fit$bestTune
+```
+
+### Variable Importance
+
+```{r gbm.importance}
+xgb_imp <- xgb.importance(feature_names = xgb.fit$finalModel$feature_names,
+               model = xgb.fit$finalModel)
+xgb.plot.importance(xgb_imp)
+```
+
+The most importance factor affecting the out-of-state tuition is the Instructional expenditure per student (`expend`), then it is room and board costs(`room_board`), pct. of faculty with terminal degree (`terminal`), pct. of faculty with Ph.D.'s (`ph_d`), and pct. of new students from top 10% of H.S. class (`Top10perc`).
+
+### Test error
+
+```{r test_error.xgb}
+pred.xgb <- predict(xgb.fit, newdata = college[-rowTrain,])
+RMSE(pred.xgb, college$outstate[-rowTrain])
+```
+
+The test error (RMSE) is 1600.625, smaller than that of the random forest model. 
+
+# Classification - `OJ` data
+
+## (a) Build a classification tree using the training data, with Purchase as the response and the other variables as predictors.
+
+```{r input_oj}
+data(OJ)
+OJ <- na.omit(OJ)
+OJ$Purchase <- factor(OJ$Purchase, c("CH","MM"))
+
+set.seed(1)
+rowTrain.oj <- createDataPartition(y = OJ$Purchase,
+                                p = 0.653,
+                                list = FALSE)
+```
+
+Use cross-validation to determine the tree size and create a plot of the final tree:
+
+```{r ctree}
+set.seed(1)
+tree <- rpart(Purchase ~.,
+              OJ,
+              subset = rowTrain.oj,
+              control = rpart.control(cp = 0))
+
+cpTable <- printcp(tree)
+# Size not consecutive
+plotcp(tree)
+# size for min
+minErr <- which.min(cpTable[,4])
+cpTable[minErr, 1]
+```
+The tree of 6 splits i.e. size 13 with $cp=0.00916$ corresponds to the lowest cross-validation error. The dashed line above is the 1SE line, so a smaller tree with 3 splits i.e. size 7 has a cross-validation error below the line. Therefore, the tree size obtained by the minimum rule is different from the tree size obtained using the 1SE rule.
+
+### Final Tree
+
+```{r summary}
+minErr <- which.min(cpTable[,4])
+tree2 <- prune(tree, cp = cpTable[minErr, 1])
+rpart.plot::rpart.plot(tree2)
+```
+
+## (b) Perform boosting on the training data and report the variable importance. 
+
+```{r gbm.class, eval=FALSE}
+set.seed(1)
+gbmA.grid <- expand.grid(n.trees = c(2000,3000,4000,5000),
+                         interaction.depth = 1:6,
+                         shrinkage = c(0.0005,0.001,0.002),
+                         n.minobsinnode = 1)
+set.seed(1)
+gbmA.fit <- train(Purchase ~ . , 
+                  OJ, 
+                  subset = rowTrain.oj, 
+                  tuneGrid = gbmA.grid,
+                  trControl = ctrl,
+                  method = "gbm",
+                  distribution = "adaboost",
+                  metric = "ROC",
+                  verbose = FALSE)
+
+ggplot(gbmA.fit, highlight = TRUE)
+```
+
+### Variale Importance
+
+```{r vi.gbm, eval=FALSE}
+summary(gbmA.fit$finalModel, las = 2, cBars = 16, cex.names = 0.6)
+```
+
+
+
+### Test Error Rate
+```{r te.rate, eval=FALSE}
+gbmA.pred <- predict(gbmA.fit, newdata = OJ[-rowTrain.oj,], type = "prob")[,1]
+```
+
